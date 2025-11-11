@@ -1,0 +1,27 @@
+    # Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Docker volumes
+postgres_data/
+kafka*_data/
+minio_data/
+opensearch_data/
+spark_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

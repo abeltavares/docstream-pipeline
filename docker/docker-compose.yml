@@ -1,0 +1,907 @@
+services:
+  # PostgreSQL - Source Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: docstream-postgres
+    environment:
+      POSTGRES_DB: docstream
+      POSTGRES_USER: docuser
+      POSTGRES_PASSWORD: docpass123
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '1'
+        reservations:
+          memory: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docuser -d docstream"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # OpenLineage Backend (Marquez)
+  marquez:
+    image: marquezproject/marquez:latest
+    container_name: docstream-marquez
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+    environment:
+      MARQUEZ_CONFIG: /usr/src/app/marquez.yml
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '0.5'
+        reservations:
+          memory: 256m
+    volumes:
+      - ./marquez/marquez.yml:/usr/src/app/marquez.yml
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - docstream-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/v1/namespaces"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # OpenLineage Web UI
+  marquez-web:
+    image: marquezproject/marquez-web:latest
+    container_name: docstream-marquez-web
+    ports:
+      - "3001:3000"
+    environment:
+      - MARQUEZ_HOST=marquez
+      - MARQUEZ_PORT=5000
+      - WEB_PORT=3000
+    depends_on:
+      marquez:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: '0.5'
+        reservations:
+          memory: 128m
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3001"]
+    networks:
+      - docstream-net
+
+  # Data Producer Service
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: docstream-producer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka1:
+        condition: service_healthy
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=docstream
+      - POSTGRES_USER=docuser
+      - POSTGRES_PASSWORD=docpass123
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "5050:5000"
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: '0.5'
+        reservations:
+          memory: 128m
+    restart: unless-stopped
+
+  # ============================================
+  # KAFKA KRAFT CLUSTER (3 Nodes)
+  # ============================================
+  kafka1:
+    image: confluentinc/cp-kafka:7.8.0
+    hostname: kafka1
+    container_name: kafka1
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:9093,2@kafka2:9093,3@kafka3:9093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka1:9092,CONTROLLER://kafka1:9093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka1:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_COMPRESSION_TYPE: 'lz4' # best cpu/compression tradeoff
+      KAFKA_HEAP_OPTS: '-Xmx512m -Xms512m' # to be inceased based on workload (keep small for demo)
+    volumes:
+      - kafka1_data:/var/lib/kafka/data
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+        reservations:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka1:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  kafka2:
+    image: confluentinc/cp-kafka:7.8.0
+    hostname: kafka2
+    container_name: kafka2
+    ports:
+      - "9094:9092"
+      - "9095:9093"
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:9093,2@kafka2:9093,3@kafka3:9093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka2:9092,CONTROLLER://kafka2:9093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka2:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_COMPRESSION_TYPE: 'lz4'
+      KAFKA_HEAP_OPTS: '-Xmx512m -Xms512m'
+    volumes:
+      - kafka2_data:/var/lib/kafka/data
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+        reservations:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka2:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  kafka3:
+    image: confluentinc/cp-kafka:7.8.0
+    hostname: kafka3
+    container_name: kafka3
+    ports:
+      - "9096:9092"
+      - "9097:9093"
+    environment:
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:9093,2@kafka2:9093,3@kafka3:9093'
+      KAFKA_LISTENERS: 'PLAINTEXT://kafka3:9092,CONTROLLER://kafka3:9093'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka3:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_COMPRESSION_TYPE: 'lz4'
+      KAFKA_HEAP_OPTS: '-Xmx512m -Xms512m'
+    volumes:
+      - kafka3_data:/var/lib/kafka/data
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+        reservations:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka3:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # ============================================
+  # SCHEMA REGISTRY
+  # ============================================
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.8.0
+    container_name: docstream-schema-registry
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+      kafka3:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka1:9092,kafka2:9092,kafka3:9092'
+      SCHEMA_REGISTRY_LISTENERS: 'http://0.0.0.0:8081'
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: '_schemas'
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 3
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: 'backward'
+      SCHEMA_REGISTRY_HEAP_OPTS: '-Xmx256m -Xms256m'
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '0.5'
+        reservations:
+          memory: 256m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # ============================================
+  # KAFKA CONNECT (with Debezium)
+  # ============================================
+  kafka-connect:
+    build:
+      context: ./kafka-connect
+      dockerfile: Dockerfile
+    container_name: docstream-kafka-connect
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+      kafka3:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: 'kafka1:9092,kafka2:9092,kafka3:9092'
+      GROUP_ID: 'docstream-connect-cluster'
+      CONFIG_STORAGE_TOPIC: 'docstream-connect-configs'
+      OFFSET_STORAGE_TOPIC: 'docstream-connect-offsets'
+      STATUS_STORAGE_TOPIC: 'docstream-connect-status'
+      CONFIG_STORAGE_REPLICATION_FACTOR: 3
+      OFFSET_STORAGE_REPLICATION_FACTOR: 3
+      STATUS_STORAGE_REPLICATION_FACTOR: 3
+      KEY_CONVERTER_SCHEMA_REGISTRY_URL: 'http://schema-registry:8081'
+      VALUE_CONVERTER_SCHEMA_REGISTRY_URL: 'http://schema-registry:8081'
+      CONNECT_PLUGIN_PATH: /kafka/connect
+      KAFKA_HEAP_OPTS: '-Xmx512m -Xms512m'
+    volumes:
+      - ./kafka-connect/debezium/connectors/postgres-connector.json:/kafka-connect/postgres-connector.json
+      - ./kafka-connect/debezium/deploy-connector.sh:/kafka-connect/deploy-connector.sh
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+        reservations:
+          memory: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        /docker-entrypoint.sh start &
+        /kafka-connect/deploy-connector.sh
+        wait
+
+  # ============================================
+  # KAFKA UI
+  # ============================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: docstream-kafka-ui
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+      kafka3:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: 'docstream-cluster'
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: 'kafka1:9092,kafka2:9092,kafka3:9092'
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: 'http://schema-registry:8081'
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: 'docstream-connect'
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: 'http://kafka-connect:8083'
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '0.5'
+        reservations:
+          memory: 256m
+
+  # MinIO (S3-compatible storage for Iceberg)
+  minio:
+    image: minio/minio:latest
+    container_name: docstream-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '0.5'
+        reservations:
+          memory: 256m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO Client - Create buckets
+  mc:
+    image: minio/mc:latest
+    container_name: docstream-minio-client
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc rm -r --force minio/warehouse;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc rm -r --force minio/checkpoints;
+      /usr/bin/mc mb minio/checkpoints;
+      /usr/bin/mc policy set public minio/warehouse;
+      /usr/bin/mc policy set public minio/checkpoints;
+      tail -f /dev/null
+      "
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+          cpus: '0.25'
+
+  # Iceberg REST Catalog
+  rest:
+    image: tabulario/iceberg-rest
+    container_name: docstream-iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+    networks:
+      - docstream-net
+    depends_on:
+      minio:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '0.5'
+        reservations:
+          memory: 256m
+
+  # OpenSearch
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: docstream-opensearch
+    platform: linux/amd64
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=false
+      - "DISABLE_INSTALL_DEMO_CONFIG=true"
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "DISABLE_SECURITY_PLUGIN=true"
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+        reservations:
+          memory: 512m
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    networks:
+      - docstream-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # OpenSearch Dashboards
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    container_name: docstream-dashboards
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    networks:
+      - docstream-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '0.5'
+        reservations:
+          memory: 256m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5601/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ============================================
+  # SPARK CLUSTER
+  # ============================================
+
+  # Spark Master
+  spark-master:
+    image: tabulario/spark-iceberg:latest
+    container_name: docstream-spark-master
+    platform: linux/amd64
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: '1'
+        reservations:
+          memory: 512m
+    volumes:
+      - ../spark_jobs:/opt/spark-jobs
+      - ../spark_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - spark_checkpoints:/tmp/checkpoints
+    networks:
+      - docstream-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Spark Worker 1
+  spark1:
+    image: tabulario/spark-iceberg:latest
+    container_name: docstream-spark-worker-1
+    platform: linux/amd64
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_NO_DAEMONIZE=true
+    deploy:
+      resources:
+        limits:
+          memory: 2.5g
+          cpus: '2'
+        reservations:
+          memory: 2g
+    volumes:
+      - ../spark_jobs:/opt/spark-jobs
+      - ../spark_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - docstream-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Spark Worker 2
+  spark2:
+    image: tabulario/spark-iceberg:latest
+    container_name: docstream-spark-worker-2
+    platform: linux/amd64
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_NO_DAEMONIZE=true
+    deploy:
+      resources:
+        limits:
+          memory: 2.5g
+          cpus: '2'
+        reservations:
+          memory: 2g
+    volumes:
+      - ../spark_jobs:/opt/spark-jobs
+      - ../spark_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - docstream-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Spark Worker 3
+  spark3:
+    image: tabulario/spark-iceberg:latest
+    container_name: docstream-spark-worker-3
+    platform: linux/amd64
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_NO_DAEMONIZE=true
+    deploy:
+      resources:
+        limits:
+          memory: 2.5g
+          cpus: '2'
+        reservations:
+          memory: 2g
+    volumes:
+      - ../spark_jobs:/opt/spark-jobs
+      - ../spark_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - docstream-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ============================================
+  # SPARK STREAMING JOBS
+  # ============================================
+
+  # Job 1: Event Enrichment
+  spark-job-enrichment:
+    image: tabulario/spark-iceberg:latest
+    container_name: docstream-spark-enrichment
+    platform: linux/amd64
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka-connect:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      rest:
+        condition: service_started
+      spark1:
+        condition: service_started
+      spark2:
+        condition: service_started
+      spark3:
+        condition: service_started
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |      
+        max_attempts=60
+        attempt=0
+        
+        # Wait for connector to be RUNNING
+        until curl -s http://kafka-connect:8083/connectors/postgres-source-connector/status 2>/dev/null | grep -q '"state":"RUNNING"'; do
+          attempt=$((attempt + 1))
+          
+          if [ $$attempt -ge $$max_attempts ]; then
+            echo "Connector status:"
+            curl -s http://kafka-connect:8083/connectors/postgres-source-connector/status 2>/dev/null || echo "Connector not found"
+            exit 1
+          fi
+          
+          if [ $((attempt % 10)) -eq 0 ]; then
+            echo "Attempt $$attempt/$$max_attempts - Checking connector..."
+          fi
+          
+          sleep 5
+        done
+              
+        /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --deploy-mode client \
+          /home/iceberg/spark-jobs/event_enrichment.py
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      PYTHONUNBUFFERED: 1
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+          cpus: '1'
+        reservations:
+          memory: 512m
+    volumes:
+      - ../spark_jobs:/home/iceberg/spark-jobs
+      - ../spark_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - docstream-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f event_enrichment || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # Job 2: Real-time Aggregations
+  spark-job-aggregations:
+    image: tabulario/spark-iceberg:latest
+    container_name: docstream-spark-aggregations
+    platform: linux/amd64
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      rest:
+        condition: service_started
+      spark-job-enrichment:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |      
+        # Wait for Iceberg table to exist
+        max_attempts=60
+        attempt=0
+        until curl -sf http://rest:8181/v1/namespaces/events/tables/documents > /dev/null 2>&1; do
+          attempt=$((attempt + 1))
+          if [ $$attempt -ge $$max_attempts ]; then
+            echo "Timeout waiting for documents table"
+            exit 1
+          fi
+          echo "Attempt $$attempt/$$max_attempts - Table not ready yet..."
+          sleep 5
+        done
+              
+        /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --deploy-mode client \
+          /home/iceberg/spark-jobs/realtime_aggregations.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka1:9092,kafka2:9092,kafka3:9092"
+      ICEBERG_CATALOG_URI: "http://rest:8181"
+      AWS_ACCESS_KEY_ID: "admin"
+      AWS_SECRET_ACCESS_KEY: "password"
+      AWS_REGION: "us-east-1"
+      S3_ENDPOINT: "http://minio:9000"
+      SPARK_WATERMARK_DELAY: "10 minutes"
+      SPARK_TRIGGER_INTERVAL: "1 minute"
+      PYTHONUNBUFFERED: "1"
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+          cpus: '1'
+        reservations:
+          memory: 512m
+    volumes:
+      - ../spark_jobs:/home/iceberg/spark-jobs
+      - ../spark_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - docstream-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f realtime_aggregations || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  # Job 3: OpenSearch Indexer
+  spark-job-opensearch:
+    image: tabulario/spark-iceberg:latest
+    container_name: docstream-spark-opensearch
+    platform: linux/amd64
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      rest:
+        condition: service_started
+      spark-job-enrichment:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |      
+        # Wait for Iceberg table
+        max_attempts=60
+        attempt=0
+        until curl -sf http://rest:8181/v1/namespaces/events/tables/documents > /dev/null 2>&1; do
+          attempt=$((attempt + 1))
+          if [ $$attempt -ge $$max_attempts ]; then
+            echo "Timeout waiting for documents table"
+            exit 1
+          fi
+          echo "Attempt $$attempt/$$max_attempts - Table not ready yet..."
+          sleep 5
+        done
+              
+        /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --deploy-mode client \
+          /home/iceberg/spark-jobs/opensearch_indexer.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka1:9092,kafka2:9092,kafka3:9092"
+      OPENSEARCH_HOST: "opensearch"
+      OPENSEARCH_PORT: "9200"
+      AWS_ACCESS_KEY_ID: "admin"
+      AWS_SECRET_ACCESS_KEY: "password"
+      AWS_REGION: "us-east-1"
+      S3_ENDPOINT: "http://minio:9000"
+      PYTHONUNBUFFERED: "1"
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+          cpus: '1'
+        reservations:
+          memory: 512m
+    volumes:
+      - ../spark_jobs:/home/iceberg/spark-jobs
+      - ../spark_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - docstream-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f opensearch_indexer || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+volumes:
+  postgres_data:
+  minio_data:
+  opensearch_data:
+  spark_checkpoints:
+  kafka1_data:
+  kafka2_data:
+  kafka3_data:
+  spark_ivy_cache:
+
+networks:
+  docstream-net:
+    driver: bridge

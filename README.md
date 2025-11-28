@@ -192,7 +192,7 @@ CREATE TABLE documents (
 - Conversion rates:
   - `sent_to_viewed_rate` = viewed / sent
   - `viewed_to_signed_rate` = signed / viewed
-  - `overall_completion_rate` = completed / sent
+  - `completion_rate` = completed / sent
 - Average processing times (view, sign, complete)
 
 **Key Features:**

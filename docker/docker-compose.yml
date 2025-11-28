@@ -427,9 +427,7 @@ services:
     entrypoint: >
       /bin/sh -c "
       until (/usr/bin/mc alias set minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
-      /usr/bin/mc rm -r --force minio/warehouse;
       /usr/bin/mc mb minio/warehouse;
-      /usr/bin/mc rm -r --force minio/checkpoints;
       /usr/bin/mc mb minio/checkpoints;
       /usr/bin/mc policy set public minio/warehouse;
       /usr/bin/mc policy set public minio/checkpoints;
@@ -685,10 +683,10 @@ services:
   # SPARK STREAMING JOBS
   # ============================================
 
-  # Job 1: Event Enrichment
-  spark-job-enrichment:
+# Job 1: CDC to Events (Enrichment with snapshot)
+  spark-job-cdc-events:
     image: tabulario/spark-iceberg:latest
-    container_name: docstream-spark-enrichment
+    container_name: docstream-spark-cdc-events
     platform: linux/amd64
     depends_on:
       kafka1:
@@ -708,42 +706,47 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |      
+        echo "Waiting for Debezium connector to be RUNNING..."
         max_attempts=60
         attempt=0
         
-        # Wait for connector to be RUNNING
         until curl -s http://kafka-connect:8083/connectors/postgres-source-connector/status 2>/dev/null | grep -q '"state":"RUNNING"'; do
           attempt=$((attempt + 1))
           
           if [ $$attempt -ge $$max_attempts ]; then
-            echo "Connector status:"
+            echo "ERROR: Connector not running after $$max_attempts attempts"
             curl -s http://kafka-connect:8083/connectors/postgres-source-connector/status 2>/dev/null || echo "Connector not found"
             exit 1
           fi
           
           if [ $((attempt % 10)) -eq 0 ]; then
-            echo "Attempt $$attempt/$$max_attempts - Checking connector..."
+            echo "Attempt $$attempt/$$max_attempts..."
           fi
           
           sleep 5
         done
+        
+        echo "Connector is RUNNING, starting CDC to Events job..."
               
         /opt/spark/bin/spark-submit \
           --master spark://spark-master:7077 \
           --deploy-mode client \
-          /home/iceberg/spark-jobs/event_enrichment.py
+          --conf spark.sql.streaming.schemaInference=true \
+          /home/iceberg/spark-jobs/cdc_to_events.py
     environment:
-      AWS_ACCESS_KEY_ID: admin
-      AWS_SECRET_ACCESS_KEY: password
-      AWS_REGION: us-east-1
-      PYTHONUNBUFFERED: 1
+      KAFKA_BOOTSTRAP_SERVERS: "kafka1:9092,kafka2:9092,kafka3:9092"
+      KAFKA_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      AWS_ACCESS_KEY_ID: "admin"
+      AWS_SECRET_ACCESS_KEY: "password"
+      AWS_REGION: "us-east-1"
+      PYTHONUNBUFFERED: "1"
     deploy:
       resources:
         limits:
-          memory: 768m
-          cpus: '1'
+          memory: 1g
+          cpus: '1.5'
         reservations:
-          memory: 512m
+          memory: 768m
     volumes:
       - ../spark_jobs:/home/iceberg/spark-jobs
       - ../spark_jobs/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
@@ -755,53 +758,69 @@ services:
         max-size: "100m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f event_enrichment || exit 1"]
+      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f cdc_to_events || exit 1"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 120s
+    restart: unless-stopped
 
-  # Job 2: Real-time Aggregations
-  spark-job-aggregations:
+  # Job 2: CDC to Metrics (Aggregations, streaming only)
+  spark-job-cdc-metrics:
     image: tabulario/spark-iceberg:latest
-    container_name: docstream-spark-aggregations
+    container_name: docstream-spark-cdc-metrics
     platform: linux/amd64
     depends_on:
       kafka1:
         condition: service_healthy
+      kafka-connect:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
       rest:
         condition: service_started
-      spark-job-enrichment:
-        condition: service_healthy
+      spark1:
+        condition: service_started
+      spark2:
+        condition: service_started
+      spark3:
+        condition: service_started
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |      
-        # Wait for Iceberg table to exist
+        echo "Waiting for Debezium connector to be RUNNING..."
         max_attempts=60
         attempt=0
-        until curl -sf http://rest:8181/v1/namespaces/events/tables/documents > /dev/null 2>&1; do
+        
+        until curl -s http://kafka-connect:8083/connectors/postgres-source-connector/status 2>/dev/null | grep -q '"state":"RUNNING"'; do
           attempt=$((attempt + 1))
+          
           if [ $$attempt -ge $$max_attempts ]; then
-            echo "Timeout waiting for documents table"
+            echo "ERROR: Connector not running after $$max_attempts attempts"
+            curl -s http://kafka-connect:8083/connectors/postgres-source-connector/status 2>/dev/null || echo "Connector not found"
             exit 1
           fi
-          echo "Attempt $$attempt/$$max_attempts - Table not ready yet..."
+          
+          if [ $((attempt % 10)) -eq 0 ]; then
+            echo "Attempt $$attempt/$$max_attempts..."
+          fi
+          
           sleep 5
         done
+        
+        echo "Connector is RUNNING, starting CDC to Metrics job..."
               
         /opt/spark/bin/spark-submit \
           --master spark://spark-master:7077 \
           --deploy-mode client \
-          /home/iceberg/spark-jobs/realtime_aggregations.py
+          --conf spark.sql.streaming.schemaInference=true \
+          /home/iceberg/spark-jobs/cdc_to_metrics.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka1:9092,kafka2:9092,kafka3:9092"
-      ICEBERG_CATALOG_URI: "http://rest:8181"
+      KAFKA_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
       AWS_ACCESS_KEY_ID: "admin"
       AWS_SECRET_ACCESS_KEY: "password"
       AWS_REGION: "us-east-1"
-      S3_ENDPOINT: "http://minio:9000"
-      SPARK_WATERMARK_DELAY: "10 minutes"
-      SPARK_TRIGGER_INTERVAL: "1 minute"
       PYTHONUNBUFFERED: "1"
     deploy:
       resources:
@@ -821,44 +840,48 @@ services:
         max-size: "100m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f realtime_aggregations || exit 1"]
+      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f cdc_to_metrics || exit 1"]
       interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 180s
+      start_period: 120s
+    restart: unless-stopped
 
-  # Job 3: OpenSearch Indexer
-  spark-job-opensearch:
+  # Job 3: Lakehouse to OpenSearch
+  spark-job-lakehouse-search:
     image: tabulario/spark-iceberg:latest
-    container_name: docstream-spark-opensearch
+    container_name: docstream-spark-lakehouse-search
     platform: linux/amd64
     depends_on:
       opensearch:
         condition: service_healthy
       rest:
         condition: service_started
-      spark-job-enrichment:
+      spark-job-cdc-events:
         condition: service_healthy
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |      
-        # Wait for Iceberg table
+        echo "Waiting for Iceberg events table..."
         max_attempts=60
         attempt=0
+        
         until curl -sf http://rest:8181/v1/namespaces/events/tables/documents > /dev/null 2>&1; do
           attempt=$((attempt + 1))
           if [ $$attempt -ge $$max_attempts ]; then
-            echo "Timeout waiting for documents table"
+            echo "ERROR: Events table not found after $$max_attempts attempts"
             exit 1
           fi
-          echo "Attempt $$attempt/$$max_attempts - Table not ready yet..."
+          echo "Attempt $$attempt/$$max_attempts..."
           sleep 5
         done
+        
+        echo "Events table ready, starting Lakehouse to Search job..."
               
         /opt/spark/bin/spark-submit \
           --master spark://spark-master:7077 \
           --deploy-mode client \
-          /home/iceberg/spark-jobs/opensearch_indexer.py
+          /home/iceberg/spark-jobs/lakehouse_to_search.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka1:9092,kafka2:9092,kafka3:9092"
       OPENSEARCH_HOST: "opensearch"
@@ -886,11 +909,12 @@ services:
         max-size: "100m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f opensearch_indexer || exit 1"]
+      test: ["CMD-SHELL", "pgrep -f spark-submit && pgrep -f lakehouse_to_search || exit 1"]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 180s
+    restart: unless-stopped
 
 volumes:
   postgres_data:

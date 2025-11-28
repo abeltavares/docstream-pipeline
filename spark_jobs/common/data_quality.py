@@ -62,7 +62,7 @@ def validate_aggregated_metrics(df: DataFrame) -> DataFrame:
         (col("total_updates") >= 0) &
         col("sent_to_viewed_rate").between(0, 1) &
         col("viewed_to_signed_rate").between(0, 1) &
-        col("overall_completion_rate").between(0, 1)
+        col("completion_rate").between(0, 1)
     )
     
     logger.info("Validation rules applied")

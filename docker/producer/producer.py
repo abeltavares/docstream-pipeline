@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
+# Config
 HISTORICAL_DOCUMENTS = 5000  # 5K historical records
 DOCUMENTS_PER_MINUTE = 3      # Real-time rate
 
